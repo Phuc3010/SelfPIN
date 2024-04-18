@@ -109,7 +109,7 @@ class SPINTrainer(Trainer):
         model: Union[PreTrainedModel, nn.Module, str] = None,
         ref_model: Optional[Union[PreTrainedModel, nn.Module, str]] = None,
         beta: float = 0.1,
-        loss_type: Literal["sigmoid", "hinge"] = "sigmoid",
+        loss_type: Literal["sigmoid", "kto_pair", "risk_averse"] = "sigmoid",
         args: TrainingArguments = None,
         data_collator: Optional[DataCollator] = None,
         label_pad_token_id: int = -100,
@@ -435,10 +435,31 @@ class SPINTrainer(Trainer):
 
         if self.loss_type == "sigmoid":
             losses = -F.logsigmoid(self.beta * logits)
-        elif self.loss_type == "hinge":
-            losses = torch.relu(1 - self.beta * logits)
+        elif self.loss_type in ["kto_pair", "risk_averse"]:
+            real_KL = (policy_real_logps- opponent_real_logps).mean().clamp(min=0)
+            generated_KL = (policy_generated_logps - opponent_generated_logps).mean().clamp(min=0)
+
+            real_logratios = policy_real_logps - opponent_real_logps
+            generated_logratios = policy_generated_logps - opponent_generated_logps
+            # As described in the KTO report, the KL term for chosen (generated) is estimated using the generated (chosen) half.
+            if self.loss_type == "kto_pair":
+                losses = torch.cat(
+                    (
+                        1 - F.sigmoid(self.beta * (real_logratios - generated_KL)),
+                        1 - F.sigmoid(self.beta * (real_KL - generated_logratios)),
+                    ),
+                    0,
+                )
+            else:
+                losses = torch.cat(
+                    (
+                        torch.log(1 - F.sigmoid(self.beta * (real_logratios - generated_KL))),
+                        torch.log(1 - F.sigmoid(self.beta * (real_KL - generated_logratios))),
+                    ),
+                    0,
+                )
         else:
-            raise ValueError(f"Unknown loss type: {self.loss_type}. Should be one of ['sigmoid', 'hinge']")
+            raise ValueError(f"Unknown loss type: {self.loss_type}. Should be one of ['sigmoid', 'kto_pair', 'risk_averse']")
 
         real_rewards = self.beta * (policy_real_logps - opponent_real_logps).detach()
         generated_rewards = self.beta * (policy_generated_logps - opponent_generated_logps).detach()
